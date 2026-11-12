@@ -1,3 +1,4 @@
+//#if 0  /* DISABLED: control_loop4.c is the active build. Delete this line and the #endif at the end of the file to switch back. */
 /**
   ******************************************************************************
   * @file    adc_sine_pwm_eoc.c
@@ -68,6 +69,68 @@
   * early, so a minimum time is never violated. If a forced flip ever needs
   * sub-100 ns placement it has to come off a timer compare instead, the way
   * PD14 does below.
+  *
+  * PB8 - THE EXTERNAL START
+  * ------------------------
+  * A rising edge on PB8 starts the run. Everything downstream is unchanged:
+  * the edge is simply what PD15's rise now waits for, and PD15 -> PF3 -> the
+  * gate -> PD15 low then proceed exactly as they did when main raised PD15 the
+  * moment the converter was going.
+  *
+  * The point is that the start instant becomes knowable to something other
+  * than this firmware. Whatever generates the edge can trigger a scope from
+  * the same signal and know exactly where the excitation begins, instead of
+  * arming a capture and hoping it overlaps.
+  *
+  * The pin is configured with a PULL-DOWN and rising-edge detection, so a
+  * disconnected input rests low and cannot start the power stage. REMOVE PB8
+  * FROM THE CubeMX GPIO INIT - this file owns it, as it does PB5, PD14, PD15
+  * and PF3.
+  *
+  * THE START CONDITION IS A HIGH LEVEL, NOT ONLY AN EDGE. The run begins when
+  * PB8 is high - whether it rose a moment ago or has been high since before
+  * the board came out of reset. That distinction is the whole usability of the
+  * thing: a bench supply left sitting at 3.3 V produces exactly one edge, when
+  * it is first connected, and none at all on any reset after that. Waiting for
+  * an edge would mean the board started once and then never again, which is
+  * precisely what happened the first time this was tried.
+  *
+  * The EXTI interrupt is still there, and is what catches a brief pulse that
+  * would be gone before the polling loop next looked. So a pulse works, a
+  * level works, and a level applied before reset works.
+  *
+  * EXT_TRIG_ENABLE 0 restores the old behaviour exactly. EXT_TRIG_TIMEOUT_MS
+  * bounds the wait, because a board that blocks forever on a start that never
+  * arrives is indistinguishable from one that has crashed; on timeout the run
+  * is abandoned and the status block says which happened.
+  *
+  * THE FREQUENCY IS IN MILLIHERTZ, AND THE TIMEBASE IS 64 BITS
+  * ----------------------------------------------------------
+  * SINE_MHZ sets the frequency in whole MILLIHERTZ, so 1234.567 Hz and
+  * 0.005 Hz are both expressible. Two things had to change to make the low end
+  * real rather than nominal.
+  *
+  * TIM2 is 32 bits at 240 MHz, so it WRAPS EVERY 17.9 SECONDS. One period at
+  * 1 mHz is a thousand seconds - fifty-five wraps - so a phase computed from a
+  * bare 32-bit tick difference is meaningless below about 0.06 Hz. The handler
+  * now carries a wrap counter: it reads the timer every few hundred
+  * nanoseconds so it cannot miss an overflow, and one compare per interrupt
+  * extends the timebase to 64 bits.
+  *
+  * The phase step also had to change scale. It used to be a Q8 fraction of a
+  * phase unit per tick; at 1 mHz the true value is 0.0179, which Q8 rounds to
+  * 4/256 - a 13% frequency error. The step is now (mul >> shift) with BOTH
+  * chosen from the frequency, so the mantissa always lands in the top bits of
+  * a 32-bit word whatever the frequency. Checked against exact arithmetic from
+  * 1 mHz to 900 kHz: worst frequency error 4 parts in 10^9, worst 64-bit
+  * product 8.3e18 against a limit of 1.8e19.
+  *
+  * The phase reference is RE-ANCHORED whenever the tick difference reaches
+  * 2^32, which is what keeps that product in range. The branch is taken once
+  * every 17.9 seconds.
+  *
+  * The gate deadline is 64 bits for the same reason: five periods at 1 mHz is
+  * five thousand seconds, and the old 32-bit deadline covered eighteen.
   *
   * THE SINE IS DERIVED FROM THE TIMER, NOT FROM A PER-SAMPLE INCREMENT
   * -------------------------------------------------------------------
@@ -294,21 +357,29 @@
 /* The sine, in millivolts about the ADC's own scale. The sine spans
    SINE_OFFSET_MV +/- SINE_AMP_MV; the comparison limits are that plus and
    minus THRESHOLD_MV. */
-#define SINE_HZ                 1UL
+/* The sine frequency, in MILLIHERTZ. 1000 is 1 Hz, 1234567 is 1234.567 Hz,
+   5 is 5 mHz. The range the arithmetic below is verified over is 1 mHz to
+   900 kHz.
+
+   A long gate at a low frequency is a long RUN: five periods at 10 mHz is
+   five hundred seconds of continuous excitation. Check GATE_SINE_PERIODS
+   against the frequency before starting something the hardware has to sit
+   through. */
+#define SINE_MHZ                1000000UL
 #define SINE_OFFSET_MV          1500
-#define SINE_AMP_MV             130
-#define THRESHOLD_MV            140
+#define SINE_AMP_MV             500
+#define THRESHOLD_MV            160
 
 /* Dwell limits, nanoseconds, measured from the last PB5 edge. Set either
    maximum to 0 to remove that ceiling. */
-#define MIN_TON_NS              300UL
+#define MIN_TON_NS              150UL
 #define MAX_TON_NS              4000UL
-#define MIN_TOFF_NS             300UL
+#define MIN_TOFF_NS             150UL
 #define MAX_TOFF_NS             4000UL
 
 /* Safety trip. Outside this window, PF3 drops and latches until reset. */
-#define SAFE_HI_MV              2600
-#define SAFE_LO_MV              0
+#define SAFE_HI_MV              2800
+#define SAFE_LO_MV              300
 
 /* 1 = police the input only while PF3 is high (see the header on why an
    undriven PC0 would otherwise trip before PF3 ever rose).
@@ -331,8 +402,17 @@
                    -> PD15_AFTER_PF3_US later, PD15 low
    The period count is a float, so 3.5 periods is expressible. */
 #define PF3_AFTER_PD15_US       1000UL
-#define GATE_SINE_PERIODS       5.0f
+#define GATE_SINE_PERIODS       20.0f
 #define PD15_AFTER_PF3_US       1000UL
+
+/* 1 = the run waits for a rising edge on PB8 before PD15 goes high.
+   0 = PD15 rises as soon as the converter is running, which is the older
+       behaviour, unchanged in every other respect. */
+#define EXT_TRIG_ENABLE         1
+
+/* How long to wait for that edge before giving up, milliseconds. 0 waits
+   forever. */
+#define EXT_TRIG_TIMEOUT_MS     30000UL
 
 /* PB5 modulates only inside the PF3 window, and is idle low outside it.
    This does NOT make PF3 an output enable. PF3 is the GATE DRIVER's own
@@ -393,6 +473,10 @@
 #define DLY_PORT                GPIOD           /* PD14 = TIM4_CH3, AF2 */
 #define DLY_PIN                 GPIO_PIN_14
 
+#define TRIG_PORT               GPIOB           /* PB8, external start  */
+#define TRIG_PIN                GPIO_PIN_8
+#define TRIG_IRQn               EXTI9_5_IRQn
+
 /* ==========================================================================
  * Derived, checked at compile time
  * ========================================================================== */
@@ -436,11 +520,50 @@
 #define PF3_DELAY_TICKS         NS_TO_TICKS((uint64_t)PF3_AFTER_PD15_US * 1000ULL)
 #define PD15_HOLD_TICKS         NS_TO_TICKS((uint64_t)PD15_AFTER_PF3_US * 1000ULL)
 
-/* Phase per TIM2 tick, Q8. The Q8 fraction is what makes the frequency exact:
-   at Q0 the per-tick advance would round to a whole phase step and the
-   frequency error would be parts in 10^4. */
-#define PHASE_PER_TICK_Q8       ((uint32_t)(((uint64_t)SINE_HZ << 40) \
-                                            / TIMER_CLK_HZ))
+/* The gate, in 64-bit ticks. At 1 mHz and five periods this is 1.2e12 - five
+   thousand seconds - which is why it can no longer be a 32-bit count. */
+#define GATE_TICKS \
+    ((uint64_t)((double)GATE_SINE_PERIODS * 1000.0 \
+                * (double)TIMER_CLK_HZ / (double)SINE_MHZ))
+
+/* WHETHER THE 64-BIT TIMEBASE IS NEEDED AT ALL.
+   TIM2 is 32 bits at 240 MHz and wraps every 17.9 s. A gate shorter than that
+   needs nothing more than the timer itself, and on this silicon the handler
+   and the conversion period are within a few nanoseconds of each other - so
+   the wrap counter, the 64-bit deadline compare and the phase re-anchor are
+   not small additions, they are the difference between main getting a slice
+   of the CPU and getting none. Measured: with them always on, main stopped
+   advancing entirely and never raised PD15.
+
+   So they are compiled in only when the gate is long enough to need them.
+   The threshold is 2^30 ticks - 4.5 s, a quarter of the wrap - which leaves
+   room for the signed compare and for the run's own preamble. Above about
+   0.2 Hz with five periods, this is 0 and the handler is byte-for-byte what
+   it was before sub-hertz support existed. */
+/* The test is on the FREQUENCY, not on GATE_TICKS, because GATE_TICKS
+   contains a cast and a float and the preprocessor can evaluate neither - it
+   would silently fail to parse rather than give the wrong answer, but it is
+   still no basis for a #if. Two hertz with five periods is a 2.5 s gate,
+   comfortably inside the 4.5 s the 32-bit path can carry.
+
+   A long gate at a HIGH frequency - say two hundred periods at 100 Hz - would
+   slip through that test, so the static assert below checks the real gate and
+   fails the build with instructions rather than letting it run wrong. */
+#define FORCE_64BIT_TIME        0
+#define NEED_64BIT_TIME         (FORCE_64BIT_TIME || (SINE_MHZ < 2000UL))
+
+#if NEED_64BIT_TIME
+typedef uint64_t tick_t;
+typedef int64_t  stick_t;
+#else
+typedef uint32_t tick_t;
+typedef int32_t  stick_t;
+#endif
+
+/* The frequency range the DDS scaling below is verified over. */
+#define SINE_MHZ_MIN            1UL
+#define SINE_MHZ_MAX            900000000UL
+
 
 /* Safety window in ADC codes, so the interrupt compares integers. */
 #define SAFE_HI_CODES           ((uint32_t)(((uint64_t)SAFE_HI_MV \
@@ -483,8 +606,13 @@ _Static_assert((1UL << (32U - LUT_SHIFT)) == LUT_N,
                "LUT_SHIFT must be 32 - log2(LUT_N)");
 _Static_assert((PD14_QUEUE_N & (PD14_QUEUE_N - 1U)) == 0U,
                "PD14_QUEUE_N must be a power of two");
-_Static_assert(((uint64_t)SINE_HZ << 40) / TIMER_CLK_HZ <= 0xFFFFFFFFULL,
-               "SINE_HZ too high for the Q8 tick scaling (limit ~937 kHz)");
+_Static_assert(SINE_MHZ >= SINE_MHZ_MIN && SINE_MHZ <= SINE_MHZ_MAX,
+               "SINE_MHZ is outside the verified 1 mHz .. 900 kHz range");
+_Static_assert(GATE_SINE_PERIODS > 0.0f, "GATE_SINE_PERIODS must be positive");
+/* GATE_TICKS cannot be checked by a _Static_assert: it is a cast of a double
+   expression, so it is not an integer constant expression and the assert is
+   rejected before it can ever fail usefully. It is checked in main instead,
+   where the value is an ordinary number - see CTRL_STATUS_BAD_GATE. */
 
 _Static_assert(MAX_TON_NS == 0UL || MAX_TON_NS > MIN_TON_NS,
                "MAX_TON_NS must exceed MIN_TON_NS, or be 0 to disable the "
@@ -526,6 +654,9 @@ _Static_assert(PD14_DELAY_TICKS + PD14_MIN_AHEAD < 65536UL,
 #define CTRL_STATUS_RUNNING     2UL
 #define CTRL_STATUS_DONE        3UL
 #define CTRL_STATUS_TRIPPED     4UL
+#define CTRL_STATUS_WAIT_TRIG   5UL   /* armed, waiting for a PB8 edge  */
+#define CTRL_STATUS_NO_TRIG     6UL   /* gave up waiting for one        */
+#define CTRL_STATUS_BAD_GATE    7UL   /* gate too long for the timebase */
 
 typedef struct
 {
@@ -542,7 +673,11 @@ typedef struct
   uint32_t adc_rate_meas_hz;    /* MEASURED: interrupts / gate duration    */
   uint32_t isr_count;           /* interrupts INSIDE the gate              */
   uint32_t gate_ticks;          /* MEASURED length of the PF3 window       */
-  uint32_t isr_max_ticks;       /* superseded by isr_max_cycles, kept 0    */
+  uint32_t ext_trig_count;      /* PB8 edges seen since reset. This word
+                                   used to be isr_max_ticks, which has been
+                                   published as 0 since the duration moved to
+                                   the cycle counter - so the index is reused
+                                   rather than moving every field after it. */
   uint32_t adc_ovr;             /* 1 if the ADC ever overran               */
   uint32_t sine_hz;
   uint32_t sine_offset_mv;
@@ -580,7 +715,16 @@ typedef struct
   uint32_t isr_total;           /* interrupts over the WHOLE run           */
   uint32_t isr_max_cycles;      /* WORST-CASE handler, in CPU cycles       */
   uint32_t cpu_hz;              /* so the host can turn those into ns      */
-  uint32_t reserved[13];
+  uint32_t sine_mhz;            /* the frequency actually running, mHz     */
+  uint32_t gate_us;             /* MEASURED gate length, microseconds. The
+                                   tick count is 32 bits and a millihertz
+                                   gate is minutes long, so trust this one. */
+  uint32_t ext_trig_enabled;    /* 1 = the run waited for a PB8 edge        */
+  uint32_t phase_mul;           /* the DDS scaling in force, for diagnosis  */
+  uint32_t phase_shift;
+  uint32_t tim2_wraps;          /* 32-bit timer overflows - the high half of
+                                   the 64-bit timebase                      */
+  uint32_t reserved[7];
 } ctrl_blk_t;
 
 _Static_assert(sizeof(ctrl_blk_t) == 256U, "status block must stay 256 bytes");
@@ -600,8 +744,29 @@ static TIM_HandleTypeDef htim2;
 static TIM_HandleTypeDef htim4;
 
 /* Written by main before the gate opens, read by the interrupt. */
-static volatile uint32_t phase_ref;
+static volatile tick_t   phase_ref;   /* ticks at the gate's opening        */
+static volatile uint32_t phase_base;  /* phase already accumulated at it    */
 static volatile uint32_t gate_open;
+
+/* The DDS step, as (mul >> shift) phase units per tick. Both are computed once
+   at startup by Dds_Scale(); see the header for why one fixed scale cannot
+   cover millihertz and kilohertz at the same time. */
+static uint32_t phase_mul;
+static uint32_t phase_shift;
+
+#if NEED_64BIT_TIME
+/* The 64-bit timebase. tim2_hi counts TIM2 overflows; the handler reads the
+   timer far more often than it wraps, so a single compare cannot miss one. */
+static volatile uint32_t tim2_hi;
+static uint32_t          tim2_last;
+#endif
+
+/* The external start. ext_trig_fired is set by the EXTI handler and cleared by
+   main just before it arms, so an edge that arrived while nobody was waiting
+   cannot fire the run. ext_trig_count keeps counting regardless, which is what
+   tells you whether a pulse is reaching the pin at all. */
+static volatile uint32_t ext_trig_fired;
+static volatile uint32_t ext_trig_count;
 
 /* The enable sequence, advanced by the interrupt. seq_deadline is always a
    valid TIM2 tick: while there is nothing to do it sits far in the future, so
@@ -615,21 +780,41 @@ static volatile uint32_t gate_open;
 
 /* Parked this far ahead when no edge is pending - about 4.5 s at 240 MHz,
    which the signed compare treats as "not yet" without any special case. */
-#define SEQ_NEVER_TICKS         0x40000000UL
+/* Parked this far ahead when nothing is due.
+   IT MUST FIT IN tick_t. Written as (1ULL << 44) unconditionally it truncated
+   to EXACTLY ZERO in the 32-bit build, so "park forever" became "fire
+   immediately": Seq_Advance() was then called on every single conversion for
+   the whole life of the program, which is what stopped main from ever
+   finishing the run and publishing it.
+   In the 64-bit build it has to exceed the longest legal gate - thousands of
+   seconds at 1 mHz - so the two cases need different values, and the runtime
+   gate check in main keeps the 32-bit case inside 0x40000000. */
+#if NEED_64BIT_TIME
+#define SEQ_NEVER_TICKS         (1ULL << 44)   /* ~20 hours */
+#else
+#define SEQ_NEVER_TICKS         0x40000000UL   /* 4.5 s, the most 32 bits
+                                                  can carry with a signed
+                                                  compare                  */
+#endif
+_Static_assert((tick_t)SEQ_NEVER_TICKS == SEQ_NEVER_TICKS,
+               "SEQ_NEVER_TICKS does not fit in tick_t - it would truncate and "
+               "the sequence deadline would fire on every conversion");
+
 
 static volatile uint32_t seq_state;
-static volatile uint32_t seq_deadline;
-static volatile uint32_t gate_meas_ticks;   /* how long PF3 was really up */
-static uint32_t          gate_ticks_cfg;    /* set once, by main          */
+static volatile tick_t   seq_deadline;
+
+static volatile tick_t   gate_meas_ticks;   /* how long PF3 was really up */
+static tick_t            gate_ticks_cfg;    /* set once, by main          */
 
 /* The safety trip. safe_arm_tick is written before safe_arm, so the interrupt
    can never see an armed trip with a stale reference. tripped is the latch -
    nothing anywhere clears it, which is what "until reset" means. */
 static volatile uint32_t safe_arm;
-static volatile uint32_t safe_arm_tick;
+static volatile tick_t   safe_arm_tick;
 static volatile uint32_t tripped;
 static volatile uint32_t trip_code;
-static volatile uint32_t trip_ticks;
+static volatile tick_t   trip_ticks;
 
 /* Owned by the interrupt alone. */
 static uint32_t pb5_high;          /* current PB5 level                    */
@@ -782,6 +967,20 @@ static void Gpio_Config(void)
   g.Pin = PWM_PIN;  HAL_GPIO_Init(PWM_PORT, &g);
   g.Pin = EN1_PIN;  HAL_GPIO_Init(EN1_PORT, &g);
   g.Pin = EN2_PIN;  HAL_GPIO_Init(EN2_PORT, &g);
+
+  /* PB8: the external start. Pull-down and rising-edge detection, so a
+     disconnected pin rests low and only a real drive can begin a run - the
+     opposite arrangement would let a floating input start the power stage.
+
+     Priority 1, below the conversion interrupt at 0. The edge only sets a
+     flag that main polls, so nothing is lost by letting a conversion finish
+     first, and the conversion path must not be delayed by anything. */
+  g.Pin  = TRIG_PIN;
+  g.Mode = GPIO_MODE_IT_RISING;
+  g.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(TRIG_PORT, &g);
+  HAL_NVIC_SetPriority(TRIG_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TRIG_IRQn);
 
   /* PD14 belongs to TIM4_CH3, AF2 - the timer drives the pin, not the CPU, so
      writing PD14's BSRR would do nothing. */
@@ -944,6 +1143,64 @@ static void Adc_Config(void)
   HAL_NVIC_EnableIRQ(ADC_IRQn);
 }
 
+/**
+  * @brief PB8 rose. Record it and get out.
+  *
+  * Deliberately does nothing but stamp a flag and a count. Raising PD15 from
+  * here would put the start of a power sequence inside an interrupt; main is
+  * already waiting a few instructions away, and the cost of letting it do the
+  * work is one poll of a volatile word.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  if (__HAL_GPIO_EXTI_GET_IT(TRIG_PIN) != 0x00U)
+  {
+    __HAL_GPIO_EXTI_CLEAR_IT(TRIG_PIN);
+    ext_trig_count++;
+    ext_trig_fired = 1U;
+  }
+}
+
+/**
+  * @brief Split the frequency into (mul, shift) so the DDS step keeps its bits.
+  *
+  * The step wanted is f * 2^32 / TIMER_CLK_HZ phase units per tick - 0.0179 at
+  * 1 mHz, 1.6e7 at 900 kHz. No single fixed-point format holds both: a scale
+  * coarse enough for the top of the range rounds the bottom to nothing, which
+  * is what the old Q8 step did, turning 1 mHz into a 13% error.
+  *
+  * So the binary point moves. This is ordinary long division carried on past
+  * the point, stopping as soon as the quotient fills the top of a 32-bit word,
+  * with the shift recording how far it went. The mantissa therefore always
+  * carries about 30 significant bits whatever the frequency, and the handler's
+  * multiply stays a single 64-bit operation.
+  *
+  * Startup only - the frequency is fixed for the run.
+  */
+static void Dds_Scale(uint32_t sine_mhz, uint32_t *mul, uint32_t *shift)
+{
+  /* Ticks per second x 1000, because the frequency is x 1000. */
+  const uint64_t den = 1000ULL * (uint64_t)TIMER_CLK_HZ;
+  uint64_t n = (uint64_t)sine_mhz << 32;      /* <= 3.9e18, no overflow */
+  uint64_t q = n / den;
+  uint64_t r = n % den;
+  uint32_t sh = 0U;
+
+  while ((q < (1ULL << 30)) && (sh < 40U))
+  {
+    r <<= 1;
+    q <<= 1;
+    if (r >= den)
+    {
+      r -= den;
+      q += 1U;
+    }
+    sh++;
+  }
+  *mul   = (uint32_t)q;
+  *shift = sh;
+}
+
 /* ==========================================================================
  * The window LUT
  * ========================================================================== */
@@ -1100,14 +1357,15 @@ static bool Dwt_Start(void)
  * off the hot path entirely. Deadlines are compared as SIGNED differences, so
  * a TIM2 wrap between arming and firing costs nothing.
  */
-static void Seq_Advance(uint32_t now)
+static void Seq_Advance(uint64_t now)
 {
   switch (seq_state)
   {
     case SEQ_WAIT_PF3:
       /* Raise the gate-driver enable and start the sine on the same tick. */
       phase_ref      = now;
-      last_edge_tick = now;
+      phase_base     = 0U;
+      last_edge_tick = (uint32_t)now;
 #if SAFE_ARM_IN_GATE
       safe_arm_tick  = now;      /* reference first, then arm */
       safe_arm       = 1U;
@@ -1161,6 +1419,23 @@ void ADC_IRQHandler(void)
   const uint32_t now = TIM2->CNT;
   const uint32_t a   = ADC1->DR;         /* clears EOC */
 
+#if NEED_64BIT_TIME
+  /* Extend the timebase to 64 bits. TIM2 wraps every 17.9 s, which is shorter
+     than this gate. The handler reads the counter every few hundred
+     nanoseconds so one compare catches every wrap. Compiled in only when the
+     gate is long enough to need it - see NEED_64BIT_TIME. */
+  if (now < tim2_last)
+  {
+    tim2_hi++;
+  }
+  tim2_last = now;
+  const tick_t now64 = ((uint64_t)tim2_hi << 32) | (uint64_t)now;
+#else
+  /* The gate fits inside one wrap of TIM2, so the timer IS the timebase and
+     every line below costs exactly what it did before sub-hertz support. */
+  const tick_t now64 = now;
+#endif
+
   isr_total++;
 
   /* PD14: re-arm from the queue if the pending compare has come out. */
@@ -1182,9 +1457,19 @@ void ADC_IRQHandler(void)
      One signed compare. The branch is not taken on all but four interrupts of
      the entire run, and taking it is what places PF3 to within one conversion
      of its deadline regardless of what else the CPU is doing. */
-  if ((int32_t)(now - seq_deadline) >= 0)
+  /* The deadline test, on the path taken by EVERY conversion.
+     A full 64-bit compare here cost what it only needs to cost four times in a
+     run, and on this silicon the handler and the conversion period are within
+     a few nanoseconds of each other - so those cycles came straight out of
+     main's share, which is what is left over. Measured: main stopped
+     advancing at all.
+     The high halves are compared first. While the deadline is parked at
+     SEQ_NEVER its high half is huge, so this is one compare that falls
+     through. Only when the run is armed do the halves match and the 32-bit
+     compare below decide anything. */
+  if ((stick_t)(now64 - seq_deadline) >= 0)
   {
-    Seq_Advance(now);
+    Seq_Advance(now64);
   }
 
   /* ---- the safety trip, checked before anything decides an output ------
@@ -1196,7 +1481,7 @@ void ADC_IRQHandler(void)
     goto out;
   }
 #if SAFE_BLANK_US
-  if (safe_arm && ((now - safe_arm_tick) >= SAFE_BLANK_TICKS))
+  if (safe_arm && ((now64 - safe_arm_tick) >= SAFE_BLANK_TICKS))
 #else
   if (safe_arm)                  /* no blanking: armed is armed */
 #endif
@@ -1209,15 +1494,15 @@ void ADC_IRQHandler(void)
         EN2_PORT->BSRR = (uint32_t)EN2_PIN << 16;   /* PF3 LOW, at once */
         gate_open  = 0U;
         trip_code  = a;
-        trip_ticks = now - safe_arm_tick;
+        trip_ticks = now64 - safe_arm_tick;
         tripped    = 1U;
 
         /* PF3 is down for good, but the rest of the sequence still has to
            run: PD15 comes down PD15_AFTER_PF3_US later exactly as it would
            have at a normal end of gate. gate_meas_ticks records how much of
            the window was actually delivered - zero if the trip beat PF3 up. */
-        gate_meas_ticks = (seq_state == SEQ_GATE) ? (now - phase_ref) : 0U;
-        seq_deadline    = now + PD15_HOLD_TICKS;
+        gate_meas_ticks = (seq_state == SEQ_GATE) ? (now64 - phase_ref) : 0U;
+        seq_deadline    = now64 + PD15_HOLD_TICKS;
         seq_state       = SEQ_POST;
 
         if (pb5_high)
@@ -1258,8 +1543,28 @@ void ADC_IRQHandler(void)
 #endif
 
   {
-    const uint32_t phase = (uint32_t)(((uint64_t)(now - phase_ref)
-                                       * PHASE_PER_TICK_Q8) >> 8);
+    /* The DDS. The tick difference is 64 bit and the step is (mul >> shift)
+       with both picked from the frequency, so one expression covers
+       millihertz and kilohertz alike. Re-anchoring keeps the product inside
+       64 bits: a difference of 2^32 against a mantissa of 2^31 is 2^63, and
+       without it a long gate would run past that. The branch is taken once
+       every 17.9 seconds. */
+#if NEED_64BIT_TIME
+    uint64_t dt = now64 - phase_ref;
+    if (dt >= (1ULL << 32))
+    {
+      phase_base += (uint32_t)((dt * phase_mul) >> phase_shift);
+      phase_ref   = now64;
+      dt          = 0U;
+    }
+    const uint32_t phase = phase_base
+                         + (uint32_t)((dt * phase_mul) >> phase_shift);
+#else
+    /* One multiply. The difference cannot exceed 2^32 and the mantissa cannot
+       exceed 2^31, so the product fits without any re-anchoring. */
+    const uint32_t phase = (uint32_t)(((uint64_t)(now64 - phase_ref)
+                                       * phase_mul) >> phase_shift);
+#endif
     const uint32_t w     = window_lut[phase >> LUT_SHIFT];
     const uint32_t hi    = w & 0xFFFFU;
     const uint32_t lo    = w >> 16;
@@ -1388,11 +1693,17 @@ static void Ctrl_Init(void)
   ctrl->isr_count           = 0U;
   ctrl->isr_total           = 0U;
   ctrl->gate_ticks          = 0U;
-  ctrl->isr_max_ticks       = 0U;
   ctrl->isr_max_cycles      = 0U;
   ctrl->cpu_hz              = HAL_RCC_GetSysClockFreq();
   ctrl->adc_ovr             = 0U;
-  ctrl->sine_hz             = SINE_HZ;
+  ctrl->sine_hz             = (SINE_MHZ + 500UL) / 1000UL;
+  ctrl->sine_mhz            = SINE_MHZ;
+  ctrl->ext_trig_enabled    = EXT_TRIG_ENABLE ? 1U : 0U;
+  ctrl->ext_trig_count      = 0U;
+  ctrl->gate_us             = 0U;
+  ctrl->phase_mul           = 0U;
+  ctrl->phase_shift         = 0U;
+  ctrl->tim2_wraps          = 0U;
   ctrl->sine_offset_mv      = SINE_OFFSET_MV;
   ctrl->sine_amp_mv         = SINE_AMP_MV;
   ctrl->threshold_mv        = THRESHOLD_MV;
@@ -1432,13 +1743,19 @@ static void Ctrl_Init(void)
 }
 
 /** @param gate_ticks the MEASURED length of the PF3 window, in TIM2 ticks. */
-static void Ctrl_Publish(uint32_t gate_ticks)
+static void Ctrl_Publish(uint64_t gate_ticks)
 {
   ctrl->isr_count        = isr_count;
   ctrl->isr_total        = isr_total;
-  ctrl->gate_ticks       = gate_ticks;
-  ctrl->isr_max_ticks    = 0U;             /* superseded */
   ctrl->isr_max_cycles   = isr_max_cycles;
+  ctrl->ext_trig_count   = ext_trig_count;
+#if NEED_64BIT_TIME
+  ctrl->tim2_wraps       = tim2_hi;
+#endif
+  ctrl->phase_mul        = phase_mul;
+  ctrl->phase_shift      = phase_shift;
+  ctrl->gate_us          = (uint32_t)(gate_ticks
+                                      / (TIMER_CLK_HZ / 1000000UL));
   ctrl->edges            = edges;
   ctrl->forced_off       = forced_off;
   ctrl->forced_on        = forced_on;
@@ -1451,15 +1768,16 @@ static void Ctrl_Publish(uint32_t gate_ticks)
   ctrl->adc_ovr          = (ADC1->ISR & ADC_ISR_OVR) ? 1U : 0U;
   ctrl->tripped          = tripped;
   ctrl->trip_code        = trip_code;
-  ctrl->trip_ticks       = trip_ticks;
+  ctrl->trip_ticks       = (uint32_t)trip_ticks;
 #if TRACE_ENABLE
   ctrl->trace_count      = trace_n;
 #endif
 
   if (gate_ticks)
   {
+    ctrl->gate_ticks       = (uint32_t)gate_ticks;   /* see gate_us */
     ctrl->adc_rate_meas_hz =
-        (uint32_t)(((uint64_t)isr_count * TIMER_CLK_HZ) / gate_ticks);
+        (uint32_t)(((uint64_t)isr_count * (uint64_t)TIMER_CLK_HZ) / gate_ticks);
   }
 }
 
@@ -1489,6 +1807,9 @@ int main(void)
   Lut_Build();
   Adc_Config();
 
+  /* The DDS scaling, once, from the configured frequency. */
+  Dds_Scale(SINE_MHZ, &phase_mul, &phase_shift);
+
   /* PB5 low, PD14 low. Tie them together before anything can move. */
   last_edge_tick = TIM2->CNT;
   pb5_high       = 0U;
@@ -1496,11 +1817,22 @@ int main(void)
 
   /* Park the sequence before the first interrupt can see it. */
   seq_state    = SEQ_IDLE;
-  seq_deadline = TIM2->CNT + SEQ_NEVER_TICKS;
+  seq_deadline = (tick_t)TIM2->CNT + SEQ_NEVER_TICKS;
 
   /* The requested window, computed once here rather than in the handler. */
-  gate_ticks_cfg =
-      (uint32_t)(GATE_SINE_PERIODS * ((float)TIMER_CLK_HZ / (float)SINE_HZ));
+  gate_ticks_cfg = GATE_TICKS;
+
+#if !NEED_64BIT_TIME
+  /* A long gate at a high frequency - two hundred periods at 100 Hz, say -
+     slips past the frequency test that chose the 32-bit timebase. Refuse to
+     run rather than wrap the deadline mid-gate, and say why: a silent wrap
+     would look like the sequence simply never finishing. */
+  if (gate_ticks_cfg > 0x40000000ULL)
+  {
+    ctrl->status = CTRL_STATUS_BAD_GATE;
+    Error_Handler();
+  }
+#endif
 
   /* The converter runs from here; the handler starts firing immediately and
      does nothing but service PD14 until the gate opens. */
@@ -1510,6 +1842,47 @@ int main(void)
     Error_Handler();
   }
 
+  /* ---- wait for the external start ------------------------------------
+     Everything above is preparation and none of it drives anything; the run
+     properly begins on the line that raises PD15. So this is where the edge
+     belongs: the board is fully armed, and the instant PB8 rises PD15 follows
+     within one turn of this loop. */
+#if EXT_TRIG_ENABLE
+  ctrl->status   = CTRL_STATUS_WAIT_TRIG;
+  ext_trig_fired = 0U;            /* discard anything that arrived earlier */
+  {
+#if EXT_TRIG_TIMEOUT_MS
+    /* Timed in MILLISECONDS off SysTick, not in timer ticks. At 240 MHz a
+       32-bit tick count tops out at 17.9 s, so the obvious
+       NS_TO_TICKS(30000 ms) silently truncated to about 6.8 s - a timeout
+       that fired early and looked like a missed trigger. */
+    const uint32_t t_wait = HAL_GetTick();
+#endif
+    /* EITHER the pin is already high, OR an edge was caught while we looked
+       away. The level test is what makes a supply left at 3.3 V work on every
+       reset; the edge flag is what catches a pulse too short to poll. */
+    while (!ext_trig_fired
+           && ((TRIG_PORT->IDR & (uint32_t)TRIG_PIN) == 0U))
+    {
+      ctrl->ext_trig_count = ext_trig_count;
+#if EXT_TRIG_TIMEOUT_MS
+      if ((HAL_GetTick() - t_wait) >= EXT_TRIG_TIMEOUT_MS)
+      {
+        /* Say so rather than sit silent. A board that blocks forever on an
+           edge that never comes looks exactly like a crashed one from the
+           outside, and the two want completely different responses. */
+        ctrl->ext_trig_count = ext_trig_count;
+        ctrl->status         = CTRL_STATUS_NO_TRIG;
+        while (1)
+        {
+          __NOP();
+        }
+      }
+#endif
+    }
+  }
+#endif
+
   /* ---- startup-circuit enable: PD15, then hand over to the interrupt ----
      PD15's own rising edge is the one thing main still places, and nothing is
      measured from it by anything except the PF3 deadline below - so a few
@@ -1517,7 +1890,11 @@ int main(void)
      it is the handler's. */
   ctrl->status = CTRL_STATUS_WAIT_GATE;
 
-  const uint32_t t_en1 = TIM2->CNT;
+#if NEED_64BIT_TIME
+  const tick_t t_en1 = ((uint64_t)tim2_hi << 32) | (uint64_t)TIM2->CNT;
+#else
+  const tick_t t_en1 = TIM2->CNT;
+#endif
   EN1_PORT->BSRR = (uint32_t)EN1_PIN;
 
 #if !SAFE_ARM_IN_GATE
@@ -1573,3 +1950,5 @@ void assert_failed(uint8_t *file, uint32_t line)
   (void)line;
 }
 #endif /* USE_FULL_ASSERT */
+
+//#endif  /* control_loop2.c disabled */
